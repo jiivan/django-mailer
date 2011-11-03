@@ -1,22 +1,14 @@
 import time
 import smtplib
 import logging
-
 from lockfile import FileLock, AlreadyLocked, LockTimeout
 from socket import error as socket_error
 
-from django.conf import settings
-from django.core.mail import send_mail as core_send_mail
-try:
-    # Django 1.2
-    from django.core.mail import get_connection
-except ImportError:
-    # ImportError: cannot import name get_connection
-    from django.core.mail import SMTPConnection
-    get_connection = lambda backend=None, fail_silently=False, **kwds: SMTPConnection(fail_silently=fail_silently)
-
 from mailer.models import Message, DontSendEntry, MessageLog
 
+from django.conf import settings
+#from django.core.mail import send_mail as core_send_mail
+from django.core.mail import EmailMultiAlternatives, EmailMessage
 
 # when queue is empty, how long to wait (in seconds) before checking again
 EMPTY_QUEUE_SLEEP = getattr(settings, "MAILER_EMPTY_QUEUE_SLEEP", 30)
@@ -25,9 +17,31 @@ EMPTY_QUEUE_SLEEP = getattr(settings, "MAILER_EMPTY_QUEUE_SLEEP", 30)
 # default behavior is to never wait for the lock to be available.
 LOCK_WAIT_TIMEOUT = getattr(settings, "MAILER_LOCK_WAIT_TIMEOUT", -1)
 
-# The actual backend to use for sending, defaulting to the Django default.
-EMAIL_BACKEND = getattr(settings, "MAILER_EMAIL_BACKEND", "django.core.mail.backends.smtp.EmailBackend")
+# default value of plain text alternative part of otherwise HTML message
+MAILER_DEFAULT_PLAIN_TEXT_ALTERNATIVE = getattr(settings,
+    "MAILER_DEFAULT_PLAIN_TEXT_ALTERNATIVE",
+    (u"Your email client does not support HTML messages. "
+     u"Please consider an upgrade") )
 
+
+def send_email(subject, message, from_email, recipient_list, content_type="text/plain"):
+    """
+    send mail with mime-type, core django send_mail doesn't have this functionality
+    """
+    if content_type == "text/plain":
+        plain_body = message
+        email = EmailMessage(subject=subject,
+                            body=message,
+                            from_email=from_email,
+                            to=recipient_list).send()
+    else:
+        email = EmailMultiAlternatives(subject=subject,
+                                       from_email=from_email,
+                                       to=recipient_list)
+        plain_body = MAILER_DEFAULT_PLAIN_TEXT_ALTERNATIVE
+        email.attach_alternative(content=plain_body, mimetype='text/plain')
+        email.attach_alternative(content=message, mimetype=content_type)
+        email.send()
 
 def prioritize():
     """
@@ -37,12 +51,12 @@ def prioritize():
     while True:
         while Message.objects.high_priority().count() or Message.objects.medium_priority().count():
             while Message.objects.high_priority().count():
-                for message in Message.objects.high_priority().order_by("when_added"):
+                for message in Message.objects.high_priority().order_by('when_added'):
                     yield message
             while Message.objects.high_priority().count() == 0 and Message.objects.medium_priority().count():
-                yield Message.objects.medium_priority().order_by("when_added")[0]
+                yield Message.objects.medium_priority().order_by('when_added')[0]
         while Message.objects.high_priority().count() == 0 and Message.objects.medium_priority().count() == 0 and Message.objects.low_priority().count():
-            yield Message.objects.low_priority().order_by("when_added")[0]
+            yield Message.objects.low_priority().order_by('when_added')[0]
         if Message.objects.non_deferred().count() == 0:
             break
 
@@ -72,32 +86,31 @@ def send_all():
     sent = 0
     
     try:
-        connection = None
         for message in prioritize():
-            try:
-                if connection is None:
-                    connection = get_connection(backend=EMAIL_BACKEND)
-                logging.info("sending message '%s' to %s" % (message.subject.encode("utf-8"), u", ".join(message.to_addresses).encode("utf-8")))
-                email = message.email
-                email.connection = connection
-                email.send()
-                MessageLog.objects.log(message, 1) # @@@ avoid using literal result code
+            if DontSendEntry.objects.has_address(message.to_address):
+                logging.info("skipping email to %s as on don't send list " % message.to_address)
+                MessageLog.objects.log(message, 2) # @@@ avoid using literal result code
                 message.delete()
-                sent += 1
-            except (socket_error, smtplib.SMTPSenderRefused, smtplib.SMTPRecipientsRefused, smtplib.SMTPAuthenticationError), err:
-                message.defer()
-                logging.info("message deferred due to failure: %s" % err)
-                MessageLog.objects.log(message, 3, log_message=str(err)) # @@@ avoid using literal result code
-                deferred += 1
-                # Get new connection, it case the connection itself has an error.
-                connection = None
+                dont_send += 1
+            else:
+                try:
+                    logging.info("sending message '%s' to %s" % (message.subject.encode("utf-8"), message.to_address.encode("utf-8")))
+                    send_email(message.subject, message.message_body, message.from_address, [message.to_address], message.get_content_type_display())
+                    MessageLog.objects.log(message, 1) # @@@ avoid using literal result code
+                    message.delete()
+                    sent += 1
+                except (socket_error, smtplib.SMTPSenderRefused, smtplib.SMTPRecipientsRefused, smtplib.SMTPAuthenticationError), err:
+                    message.defer()
+                    logging.info("message deferred due to failure: %s" % err)
+                    MessageLog.objects.log(message, 3, log_message=str(err)) # @@@ avoid using literal result code
+                    deferred += 1
     finally:
         logging.debug("releasing lock...")
         lock.release()
         logging.debug("released.")
     
     logging.info("")
-    logging.info("%s sent; %s deferred;" % (sent, deferred))
+    logging.info("%s sent; %s deferred; %s don't send" % (sent, deferred, dont_send))
     logging.info("done in %.2f seconds" % (time.time() - start_time))
 
 def send_loop():
